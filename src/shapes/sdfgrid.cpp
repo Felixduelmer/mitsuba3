@@ -15,11 +15,11 @@
 #include <drjit/texture.h>
 
 #if defined(MI_ENABLE_EMBREE)
-#include <embree3/rtcore.h>
+#  include <embree3/rtcore.h>
 #endif
 
 #if defined(MI_ENABLE_CUDA)
-#include "optix/sdfgrid.cuh"
+#  include "optix/sdfgrid.cuh"
 #endif
 
 NAMESPACE_BEGIN(mitsuba)
@@ -164,8 +164,9 @@ public:
             if (tensor->shape(3) != 1)
                 Throw("SDF grid shape at index 3 is %lu, expected 1",
                       tensor->shape(3));
-            m_grid_texture = InputTexture3f(*tensor, true, true,
-                dr::FilterMode::Linear, dr::WrapMode::Clamp);
+            m_grid_texture = InputTexture3f(
+                (const typename InputTexture3f::TensorXf &) *tensor,
+                true, true, dr::FilterMode::Linear, dr::WrapMode::Clamp);
         } else {
             Throw("The SDF values must be specified with either the "
                   "\"filename\" or \"grid\" parameter!");
@@ -236,9 +237,21 @@ public:
             if constexpr (dr::is_jit_v<Float>)
                 dr::sync_thread();
 
-            // Update the scalar value of the matrix
-            m_to_world = m_to_world.value();
-            m_grid_texture.set_tensor(m_grid_texture.tensor());
+            if constexpr (dr::is_diff_v<Float>) {
+                Transform4f to_world = m_to_world.value();
+                // Re-attach inverse_transpose to original matrix
+                if (dr::grad_enabled(to_world.matrix)) {
+                    Matrix4f invt_diff = dr::inverse_transpose(to_world.matrix);
+                    to_world.inverse_transpose =
+                        dr::replace_grad(to_world.inverse_transpose, invt_diff);
+                }
+                m_to_world = to_world;
+            } else {
+                // Update the scalar value of the matrix
+                m_to_world = m_to_world.value();
+            }
+
+            m_grid_texture.update_inplace();
 
             update();
         }
@@ -1105,7 +1118,7 @@ private:
 
 #if defined(MI_ENABLE_CUDA)
     static constexpr uint32_t optix_geometry_flags[1] = {
-        OPTIX_GEOMETRY_FLAG_NONE
+        OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT
     };
 #endif
 

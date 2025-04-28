@@ -18,7 +18,6 @@
 # if defined(MI_USE_OPTIX_HEADERS)
     #include <optix_function_table_definition.h>
 # endif
-    #include "../shapes/optix/mesh.cuh"
 #endif
 
 NAMESPACE_BEGIN(mitsuba)
@@ -185,6 +184,19 @@ Mesh<Float, Spectrum>::bbox(ScalarIndex index) const {
                                                                dr::maximum(dr::maximum(v0, v1), v2));
 }
 
+MI_VARIANT void
+Mesh<Float, Spectrum>::set_bsdf(typename Mesh<Float, Spectrum>::BSDF *bsdf) {
+    bool backside_changed =
+        !m_bsdf || (bsdf && (has_flag(m_bsdf->flags(), BSDFFlags::BackSide) !=
+                             has_flag(bsdf->flags(), BSDFFlags::BackSide)));
+    m_bsdf = bsdf;
+
+    // Since `build_indirect_silhouette_distribution()` checks attributes of the BSDF
+    // while building the silhouette sampling distribution, we have to re-run it
+    // here to be safe if the relevant BSDF flags changed.
+    if (backside_changed && !m_sil_dedge_pmf.empty())
+        build_indirect_silhouette_distribution();
+}
 
 MI_VARIANT void Mesh<Float, Spectrum>::write_ply(const std::string &filename) const {
     ref<FileStream> stream =
@@ -430,23 +442,13 @@ MI_VARIANT void Mesh<Float, Spectrum>::recompute_bbox() {
 
 MI_VARIANT void Mesh<Float, Spectrum>::build_pmf() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    dr::scoped_symbolic_independence<Float> guard{};
 
     if (m_face_count == 0)
         Throw("Cannot create sampling table for an empty mesh: %s", to_string());
 
     if constexpr (!dr::is_jit_v<Float>) {
-        if (!m_area_pmf.empty())
-            return; // already built!
-
-        auto &&vertex_positions =
-            dr::migrate(m_vertex_positions, AllocType::Host);
-        auto &&faces = dr::migrate(m_faces, AllocType::Host);
-        if constexpr (dr::is_jit_v<Float>)
-            dr::sync_thread();
-
-        const InputFloat *pos_p  = vertex_positions.data();
-        const ScalarIndex *idx_p = faces.data();
+        const InputFloat *pos_p  = m_vertex_positions.data();
+        const ScalarIndex *idx_p = m_faces.data();
 
         std::vector<ScalarFloat> table(m_face_count);
         for (ScalarIndex i = 0; i < m_face_count; i++) {
@@ -461,8 +463,11 @@ MI_VARIANT void Mesh<Float, Spectrum>::build_pmf() {
 
         m_area_pmf = DiscreteDistribution<Float>(table.data(), m_face_count);
     } else {
+        dr::scoped_disable_symbolic<Float> guard{};
+
         Vector3u v_idx = face_indices(dr::arange<UInt32>(m_face_count));
-        Point3f p0 = vertex_position(v_idx[0]), p1 = vertex_position(v_idx[1]),
+        Point3f p0 = vertex_position(v_idx[0]),
+                p1 = vertex_position(v_idx[1]),
                 p2 = vertex_position(v_idx[2]);
 
         Float face_surface_area = .5f * dr::norm(dr::cross(p1 - p0, p2 - p0));
@@ -1558,6 +1563,14 @@ Mesh<Float, Spectrum>::compute_surface_interaction(const Ray3f &ray,
 //! @{ \name Mesh attributes
 // =============================================================
 
+MI_VARIANT typename Mesh<Float, Spectrum>::FloatStorage &
+Mesh<Float, Spectrum>::attribute_buffer(const std::string &name) {
+    auto attribute = m_mesh_attributes.find(name);
+    if (attribute == m_mesh_attributes.end())
+        Throw("attribute_buffer(): attribute %s doesn't exist.", name.c_str());
+    return attribute->second.buf;
+}
+
 MI_VARIANT void Mesh<Float, Spectrum>::add_attribute(const std::string& name,
                                                      size_t dim,
                                                      const std::vector<InputFloat>& data) {
@@ -1568,7 +1581,7 @@ MI_VARIANT void Mesh<Float, Spectrum>::add_attribute(const std::string& name,
     bool is_vertex_attr = name.find("vertex_") == 0;
     bool is_face_attr   = name.find("face_") == 0;
     if (!is_vertex_attr && !is_face_attr)
-        Throw("add_attribute(): attribute name must start with either \"vertex_\" of \"face_\".");
+        Throw("add_attribute(): attribute name must start with either \"vertex_\" or \"face_\".");
 
     MeshAttributeType type = is_vertex_attr ? MeshAttributeType::Vertex : MeshAttributeType::Face;
     size_t count = is_vertex_attr ? m_vertex_count : m_face_count;
@@ -1586,6 +1599,16 @@ MI_VARIANT void Mesh<Float, Spectrum>::add_attribute(const std::string& name,
 
     FloatStorage buffer = dr::load<FloatStorage>(data.data(), count * dim);
     m_mesh_attributes.insert({ name, { dim, type, buffer } });
+}
+
+MI_VARIANT void
+Mesh<Float, Spectrum>::remove_attribute(const std::string &name) {
+    const auto& it = m_mesh_attributes.find(name);
+    if (it == m_mesh_attributes.end()) {
+        // Maybe it exists as a texture attribute, try that.
+        return Base::remove_attribute(name);
+    }
+    m_mesh_attributes.erase(it);
 }
 
 MI_VARIANT typename Mesh<Float, Spectrum>::Mask

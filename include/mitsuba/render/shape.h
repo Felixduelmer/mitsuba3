@@ -18,26 +18,38 @@ NAMESPACE_BEGIN(mitsuba)
 /// Enumeration of all shape types in Mitsuba
 enum class ShapeType : uint32_t {
     /// Meshes (`ply`, `obj`, `serialized`)
-    Mesh = 0u,
+    Mesh = 1u << 0,
+
+    /// Rectangle: a particular type of mesh
+    Rectangle = Mesh | (1u << 8), // Tagged with an extra bit
+
     /// B-Spline curves (`bsplinecurve`)
-    BSplineCurve = 1u,
-    /// Cylinders (`cylinder`)
-    Cylinder = 2u,
-    /// Disks (`disk`)
-    Disk = 3u,
+    BSplineCurve = 1u << 1,
+
     /// Linear curves (`linearcurve`)
-    LinearCurve = 4u,
-    /// Rectangles (`rectangle`)
-    Rectangle = 5u,
+    LinearCurve = 1u << 2,
+
+    /// Cylinders (`cylinder`)
+    Cylinder = 1u << 3,
+
+    /// Disks (`disk`)
+    Disk = 1u << 4,
+
     /// SDF Grids (`sdfgrid`)
-    SDFGrid = 6u,
+    SDFGrid = 1u << 5,
+
     /// Spheres (`sphere`)
-    Sphere = 7u,
+    Sphere = 1u << 6,
+
     /// Instance (`instance`)
-    Instance = 8u,
-    /// Other shapes
-    Other = 9u
+    Instance = 1u << 7,
+
+    // Note: 1u << 8 is taken by Rectangle, continue with 1 << 9
+
+    /// Invalid for default initialization
+    Invalid = 0
 };
+
 MI_DECLARE_ENUM_OPERATORS(ShapeType)
 
 /**
@@ -217,6 +229,18 @@ struct SilhouetteSample : public PositionSample<Float_, Spectrum_> {
  * This class provides core functionality for sampling positions on surfaces,
  * computing ray intersections, and bounding shapes within ray intersection
  * acceleration data structures.
+ *
+ * Two types of attributes can be associated with a shape:
+ * 1. Texture attributes (\c Shape::add_texture_attribute), which must be
+ *    a \c Texture instance but can have arbitrary resolution. The UV
+ *    parametrization of the shape is used to look up texture attribute values.
+ * 2. Mesh attributes (\c Mesh::add_attribute), which can only be added
+ *    to mesh-type Shapes. They must be either per-vertex or per-face attributes,
+ *    their name must start with "vertex_" (resp. "face_"), and their size
+ *    must match the number of vertices (resp. faces) of the mesh.
+ *
+ * Once registered, attributes are queried with the \c Shape::eval_attribute*
+ * methods.
  */
 template <typename Float, typename Spectrum>
 class MI_EXPORT_LIB Shape : public Object {
@@ -680,6 +704,35 @@ public:
     virtual Float surface_area() const;
 
     /**
+     * \brief Add a texture attribute with the given \c name.
+     *
+     * If an attribute with the same name already exists, it is replaced.
+     *
+     * Note that \c Mesh shapes can additionally handle per-vertex
+     * and per-face attributes via the \c Mesh::add_attribute method.
+     *
+     * \param name
+     *     Name of the attribute
+     * \param texture
+     *     Texture to store. The dimensionality of the attribute
+     *     is simply the channel count of the texture.
+     */
+    virtual void add_texture_attribute(const std::string &name, Texture *texture);
+
+    /// Return the texture attribute associated with \c name.
+    Texture *texture_attribute(const std::string &name);
+
+    /// Return the texture attribute associated with \c name.
+    const Texture *texture_attribute(const std::string &name) const;
+
+    /**
+     * \brief Remove a texture texture with the given \c name.
+     *
+     * Throws an exception if the attribute was not registered.
+     */
+    virtual void remove_attribute(const std::string &name);
+
+    /**
      * \brief Returns whether this shape contains the specified attribute.
      *
      * \param name
@@ -773,7 +826,7 @@ public:
     void set_id(const std::string& id) override { m_id = id; };
 
     /// Is this shape a triangle mesh?
-    bool is_mesh() const { return (shape_type() == +ShapeType::Mesh); };
+    bool is_mesh() const { return shape_type() & ShapeType::Mesh; }
 
     /// Returns the shape type \ref ShapeType of this shape
     uint32_t shape_type() const { return (uint32_t) m_shape_type; }
@@ -782,7 +835,7 @@ public:
     bool is_shapegroup() const { return class_()->name() == "ShapeGroupPlugin"; };
 
     /// Is this shape an instance?
-    bool is_instance() const { return (shape_type() == +ShapeType::Instance); };
+    bool is_instance() const { return shape_type() == +ShapeType::Instance; };
 
     /// Does the surface of this shape mark a medium transition?
     bool is_medium_transition() const { return m_interior_medium.get() != nullptr ||
@@ -799,6 +852,9 @@ public:
 
     /// Return the shape's BSDF
     BSDF *bsdf(Mask /*unused*/ = true) { return m_bsdf.get(); }
+
+    /// Set the shape's BSDF
+    virtual void set_bsdf(BSDF *bsdf);
 
     /// Is this shape also an area emitter?
     bool is_emitter() const { return (bool) m_emitter; }
@@ -894,7 +950,7 @@ public:
      * The default implementation throws an exception.
      */
     virtual void optix_prepare_ias(const OptixDeviceContext& /*context*/,
-                                   std::vector<OptixInstance>& /*instances*/,
+                                   std::vector<OptixInstance>& /*out_instances*/,
                                    uint32_t /*instance_id*/,
                                    const ScalarTransform4f& /*transf*/);
 
@@ -910,7 +966,7 @@ public:
      *     The array of hitgroup records where the new HitGroupRecords should be
      *     appended.
      *
-     * \param program_groups
+     * \param pg
      *     The array of available program groups (used to pack the OptiX header
      *     at the beginning of the record).
      *
@@ -918,10 +974,11 @@ public:
      * \ref data field with \ref m_optix_data_ptr. It then calls \ref
      * optixSbtRecordPackHeader with one of the OptixProgramGroup of the \ref
      * program_groups array (the actual program group index is inferred by the
-     * type of the Shape, see \ref get_shape_descr_idx()).
+     * type of the Shape, see \ref OptixProgramGroupMapping).
      */
     virtual void optix_fill_hitgroup_records(std::vector<HitGroupSbtRecord> &hitgroup_records,
-                                             const OptixProgramGroup *program_groups);
+                                             const OptixProgramGroup *pg,
+                                             const OptixProgramGroupMapping &pg_mapping);
 #endif
 
     void traverse(TraversalCallback *callback) override;
@@ -964,7 +1021,7 @@ protected:
     ref<Medium> m_interior_medium;
     ref<Medium> m_exterior_medium;
     std::string m_id;
-    ShapeType m_shape_type = ShapeType::Other;
+    ShapeType m_shape_type = ShapeType::Invalid;
 
     uint32_t m_discontinuity_types = (uint32_t) DiscontinuityFlags::Empty;
     /// Sampling weight (proportional to scene)
@@ -1109,7 +1166,7 @@ MI_CALL_TEMPLATE_BEGIN(Shape)
     DRJIT_CALL_GETTER(shape_type)
     auto is_emitter() const { return emitter() != nullptr; }
     auto is_sensor() const { return sensor() != nullptr; }
-    auto is_mesh() const { return shape_type() == (uint32_t) mitsuba::ShapeType::Mesh; }
+    auto is_mesh() const { return (shape_type() & +mitsuba::ShapeType::Mesh) != 0; }
     auto is_medium_transition() const { return interior_medium() != nullptr ||
                                                exterior_medium() != nullptr; }
 MI_CALL_TEMPLATE_END(Shape)

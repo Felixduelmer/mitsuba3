@@ -11,10 +11,7 @@ MI_VARIANT ShapeGroup<Float, Spectrum>::ShapeGroup(const Properties &props) {
     if constexpr (!dr::is_cuda_v<Float>)
         m_kdtree = new ShapeKDTree(props);
 #endif
-    m_has_meshes = false;
-    m_has_others = false;
-    m_has_bspline_curves = false;
-    m_has_linear_curves = false;
+    m_shape_types = 0;
 
     // Add children to the underlying data structure
     for (auto &kv : props.objects()) {
@@ -42,18 +39,7 @@ MI_VARIANT ShapeGroup<Float, Spectrum>::ShapeGroup(const Properties &props) {
                 if constexpr (!dr::is_cuda_v<Float>)
                     m_kdtree->add_shape(shape);
 #endif
-                uint32_t type = shape->shape_type();
-                bool is_mesh = (type == +ShapeType::Mesh);
-                m_has_meshes |= is_mesh;
-
-                bool is_bspline = (type == +ShapeType::BSplineCurve);
-                m_has_bspline_curves |= is_bspline;
-
-                bool is_linear = (type == +ShapeType::LinearCurve);
-                m_has_linear_curves |= is_linear;
-
-                bool is_other = !is_mesh && !is_bspline && !is_linear;
-                m_has_others |= is_other;
+                m_shape_types |= (uint32_t) shape->shape_type();
             }
         } else {
             Throw("Tried to add an unsupported object of type \"%s\"", kv.second);
@@ -158,15 +144,17 @@ ShapeGroup<Float, Spectrum>::primitive_count() const {
 
 #if defined(MI_ENABLE_CUDA)
 MI_VARIANT void ShapeGroup<Float, Spectrum>::optix_prepare_ias(
-    const OptixDeviceContext &context, std::vector<OptixInstance> &instances,
+    const OptixDeviceContext &context, std::vector<OptixInstance> &out_instances,
     uint32_t instance_id, const ScalarTransform4f &transf) {
-    prepare_ias(context, m_shapes, m_sbt_offset, m_accel, instance_id, transf, instances);
+    prepare_ias(context, m_shapes, m_sbt_offset, m_accel, instance_id, transf, out_instances);
 }
 
-MI_VARIANT void ShapeGroup<Float, Spectrum>::optix_fill_hitgroup_records(std::vector<HitGroupSbtRecord> &hitgroup_records,
-                                                                         const OptixProgramGroup *program_groups) {
+MI_VARIANT void ShapeGroup<Float, Spectrum>::optix_fill_hitgroup_records(
+    std::vector<HitGroupSbtRecord> &hitgroup_records,
+    const OptixProgramGroup *program_groups,
+    const OptixProgramGroupMapping &pg_mapping) {
     m_sbt_offset = (uint32_t) hitgroup_records.size();
-    fill_hitgroup_records(m_shapes, hitgroup_records, program_groups);
+    fill_hitgroup_records(m_shapes, hitgroup_records, program_groups, pg_mapping);
 }
 
 MI_VARIANT void ShapeGroup<Float, Spectrum>::optix_prepare_geometry() { }

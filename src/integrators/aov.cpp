@@ -281,10 +281,18 @@ public:
                     *aovs++ = si.n.z();
                     break;
 
-                case Type::ShadingNormal:
-                    *aovs++ = si.sh_frame.n.x();
-                    *aovs++ = si.sh_frame.n.y();
-                    *aovs++ = si.sh_frame.n.z();
+                case Type::ShadingNormal: {
+                        Frame3f sh_frame = dr::zeros<Frame3f>();
+                        if (dr::any_or<true>(si.is_valid()))
+                        {
+                            Mask valid = active && si.is_valid();
+                            BSDFPtr m_bsdf = si.bsdf(ray);
+                            sh_frame = m_bsdf->sh_frame(si, valid);
+                        }
+                        *aovs++ = sh_frame.n.x();
+                        *aovs++ = sh_frame.n.y();
+                        *aovs++ = sh_frame.n.z();
+                    }
                     break;
 
                 case Type::dPdU:
@@ -355,7 +363,7 @@ public:
 
     TensorXf render(Scene *scene,
                     Sensor *sensor,
-                    uint32_t seed,
+                    UInt32 seed,
                     uint32_t spp,
                     bool develop,
                     bool evaluate) override {
@@ -386,7 +394,7 @@ public:
     TensorXf render_forward(Scene* scene,
                             void* params,
                             Sensor *sensor,
-                            uint32_t seed = 0,
+                            UInt32 seed = 0,
                             uint32_t spp = 0) override {
 
         // Perform forward mode propagation just for AOV image
@@ -421,7 +429,7 @@ public:
                          void* params,
                          const TensorXf& grad_in,
                          Sensor* sensor,
-                         uint32_t seed = 0,
+                         UInt32 seed = 0,
                          uint32_t spp = 0) override {
         size_t base_ch_count = sensor->film()->base_channels_count();
         auto [image_grads, aovs_grad] = split_channels(base_ch_count, grad_in);

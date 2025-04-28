@@ -65,7 +65,13 @@ Bitmap texture (:monosp:`bitmap`)
    - Specifies the underlying texture storage format. The following options are
      currently available:
 
-     - ``variant``(default): Use the corresponding native floating point representation
+     - ``auto`` (default): If loading a texture from a bitmap, use half
+         precision for bitmap data with 16 or lower bit depth, otherwise use
+         the native floating point representation of the Mitsuba variant. For
+         variants using a spectral color representation this option is the same
+         as `variant`.
+
+     - ``variant``: Use the corresponding native floating point representation
          of the Mitsuba variant
 
      - ``fp16``: Forcibly store the texture in half precision
@@ -167,13 +173,15 @@ public:
 
         // Format
         {
-            std::string format_str = props.string("format", "variant");
-            if (format_str == "variant")
+            std::string format_str = props.string("format", "auto");
+            if (format_str == "auto")
+                m_format = Format::Auto;
+            else if (format_str == "variant")
                 m_format = Format::Variant;
             else if (format_str == "fp16")
                 m_format = Format::Float16;
             else
-                Throw("Invalid format \"%s\", must be one of: "
+                Throw("Invalid format \"%s\", must be one of: \"auto\", "
                       "\"variant\", or \"fp16\"!", format_str);
         }
 
@@ -221,9 +229,6 @@ protected:
     Object* expand_1() const {
         if (m_bitmap) {
             Format format = m_format;
-
-// TODO: Temporarily disable this as LLVM FP16 gather/scatter operations are costly
-#if 0
             // Format auto means we store texture as FP16 when possible.
             // Skip this conversion for spectral variants as we want to perform
             // spectral upsampling in the variant's native FP representation
@@ -233,12 +238,11 @@ protected:
                 if (m_format == Format::Auto && bytes_p_ch <= 2)
                     format = Format::Float16;
             }
-#endif
 
             if (format == Format::Float16)
                 return expand_bitmap<dr::replace_scalar_t<Float, dr::half>>();
             else
-               return expand_bitmap<Float>();
+                return expand_bitmap<Float>();
         }
 
         // Otherwise, initializing using tensor
@@ -318,7 +322,7 @@ protected:
             m_wrap_mode,
             m_raw,
             m_accel,
-            tensor);
+            std::move(tensor));
     }
 
 private:
@@ -338,6 +342,7 @@ private:
     }
 
     enum class Format {
+        Auto,
         Variant,
         Float16
     } m_format;
@@ -362,26 +367,29 @@ public:
     using StoredTensorXf         = dr::replace_scalar_t<TensorXf, StoredScalar>;
     using StoredTexture2f        = dr::Texture<StoredType, 2>;
 
+    template <typename Tensor>
     BitmapTextureImpl(const Properties &props,
-            const std::string& name,
-            const ScalarTransform3f& transform,
-            dr::FilterMode filter_mode,
-            dr::WrapMode wrap_mode,
-            bool raw,
-            bool accel,
-            StoredTensorXf& tensor) :
+                      const std::string& name,
+                      const ScalarTransform3f& transform,
+                      dr::FilterMode filter_mode,
+                      dr::WrapMode wrap_mode,
+                      bool raw,
+                      bool accel,
+                      Tensor&& tensor) :
         Texture(props),
         m_name(name),
         m_transform(transform),
         m_accel(accel),
-        m_raw(raw),
-        m_texture(tensor, accel, accel, filter_mode, wrap_mode) {
+        m_raw(raw) {
 
         /* Compute mean without migrating texture data
            i.e. Avoid call to m_texture.tensor() that triggers migration.
            For CUDA-variants, ideally want to solely keep data as CUDA texture
         */
         rebuild_internals(tensor, true, false);
+
+        m_texture = StoredTexture2f(std::forward<Tensor>(tensor), accel, accel,
+                                    filter_mode, wrap_mode);
     }
 
     void traverse(TraversalCallback *callback) override {
@@ -389,8 +397,7 @@ public:
         callback->put_parameter("to_uv", m_transform,        +ParamFlags::NonDifferentiable);
     }
 
-    void
-    parameters_changed(const std::vector<std::string> &keys = {}) override {
+    void parameters_changed(const std::vector<std::string> &keys = {}) override {
         if (keys.empty() || string::contains(keys, "data")) {
             const size_t channels = m_texture.shape()[2];
             if (channels != 1 && channels != 3)
@@ -403,7 +410,7 @@ public:
                       " it must be at least 2x2 pixels in size!",
                       to_string());
 
-            m_texture.set_tensor(m_texture.tensor());
+            m_texture.update_inplace();
             rebuild_internals(m_texture.tensor(), true, m_distr2d != nullptr);
         }
     }
@@ -796,13 +803,14 @@ protected:
         if (m_transform != ScalarTransform3f())
             dr::make_opaque(m_transform);
 
-        size_t pixel_count = (size_t) dr::prod(resolution());
-        const size_t channels = m_texture.shape()[2];
-        bool range_issue = false;
+        const dr::vector<size_t> &shape = tensor.shape();
+        size_t pixel_count = shape[0] * shape[1],
+               channels    = shape[2];
 
+        bool range_issue = false;
         using FloatStorage = DynamicBuffer<Float>;
         using StoredTypeArray= DynamicBuffer<StoredType>;
-        FloatStorage values = dr::empty<FloatStorage>(pixel_count);
+        FloatStorage values;
 
         if (channels == 3) {
             if constexpr (dr::is_jit_v<Float>) {
@@ -819,7 +827,11 @@ protected:
                     values = luminance(colors_fl);
             } else {
                 StoredScalar* ptr = (StoredScalar*) tensor.data();
-                ScalarFloat *out = values.data(), mean = 0;
+                ScalarFloat *out = nullptr, mean = 0;
+                if (init_distr) {
+                    values = dr::empty<FloatStorage>(pixel_count);
+                    out = values.data();
+                }
 
                 for (size_t i = 0; i < pixel_count; ++i) {
                     Color3f col(ptr[0], ptr[1], ptr[2]);
@@ -831,7 +843,8 @@ protected:
                     else
                         lum = luminance(col);
 
-                    *out++ = lum;
+                    if (init_distr)
+                        *out++ = lum;
                     mean += lum;
                     range_issue |= lum < 0 || lum > 1;
                 }
@@ -843,11 +856,16 @@ protected:
                 values = tensor.array();
             } else {
                 StoredScalar* ptr = (StoredScalar*) tensor.data();
-                ScalarFloat *out = values.data(), mean = 0;
+                ScalarFloat *out = nullptr, mean = 0;
+                if (init_distr) {
+                    values = dr::empty<FloatStorage>(pixel_count);
+                    out = values.data();
+                }
                 for (size_t i = 0; i < pixel_count; ++i) {
                     ScalarFloat value = ptr[i];
-                    *out++ = value;
-                    m_mean += value;
+                    if (init_distr)
+                        *out++ = value;
+                    mean += value;
                     range_issue |= value < 0 || value > 1;
                 }
                 m_mean = mean / pixel_count;
@@ -882,7 +900,7 @@ protected:
     MI_INLINE void init_distr() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_distr2d) {
-            dr::scoped_symbolic_independence<Float> guard{};
+            dr::scoped_disable_symbolic<Float> guard{};
             auto self = const_cast<BitmapTextureImpl *>(this);
             self->rebuild_internals(m_texture.tensor(), false, true);
         }
